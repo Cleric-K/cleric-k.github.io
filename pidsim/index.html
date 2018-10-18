@@ -1,0 +1,901 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <script type="text/javascript" src="jquery-3.2.1.min.js"></script>
+    <script type="text/javascript" src="smoothie.js"></script>
+    <script type="text/javascript">
+
+    var config = {};
+
+    var sVel = new TimeSeries();
+    var sRc = new TimeSeries();
+    var sP = new TimeSeries();
+    var sI = new TimeSeries();
+    var sD = new TimeSeries();
+    var sF = new TimeSeries();
+    var sSum = new TimeSeries();
+    var sThr = new TimeSeries();
+    var rcCommandRaw = 0;
+    var rcThrottle = 0.5;
+
+    // scales loosely based on betaflight values
+    var PTERM_SCALE = 0.032029;
+    var ITERM_SCALE = 0.244381;
+    var DTERM_SCALE = 0.000529;
+    var FEEDFORWARD_SCALE = 0.0013754;
+
+    var NOISE = 0//100;
+    var STEP = .005;
+    var UPDATE_GRAPH_INTERVAL = 1;
+    var MAX_PID = 2000;
+
+
+    var BALANCER_MOMENT_OF_INERTIA = .00002/100;
+    var BALANCER_DRAG = 0.00000001;
+
+    var MOTOR_MOMENT_OF_INERTIA = .05;
+    var MOTOR_DRAG = 1;
+
+
+    var prevGyroAngularVelocity=0;
+    var gyroDelayer = new Delayer(5);
+    var noiseFilter = new MovingAverage(100, 30);
+    var rcFilter = new MovingAverage(10, 1);
+    var spFilter = new MovingAverage(2, 1);
+    var dRcFilter = new Pt1Filter(11); // betaflight default
+    var dFilter = new MovingAverage(2, 1);
+    var thrFilter = new MovingAverage(10, 1);
+    var dThrFilter = new Pt1Filter(15); // ANTI_GRAVITY_THROTTLE_FILTER_CUTOFF, betaflight default
+    var rcCurve = new RcCurve();
+    
+    var iteration = 0;
+    
+    var balancer = new Balancer();
+    var balancerPanel;
+    var tracesChart;
+    
+    var drawRequestId = null;
+    var withThrottle = false;
+    var paused = false;
+
+
+    var P = 0,
+        I = 0,
+        D = 0,
+        F = 0,
+        Iterm = 0,
+        ffTransition = 0,
+        prevRcCommand = 0,
+        iTermRelaxEnabled = true;
+        antiGravityGain = 2000;
+
+
+    function reset() {
+      balancer.reset();
+      gyroDelayer.reset();
+      noiseFilter.reset();
+      rcFilter.reset();
+      spFilter.reset();
+      dRcFilter.reset();
+      dFilter.reset();
+      thrFilter.reset();
+      dThrFilter.reset();
+      prevGyroAngularVelocity = prevRcCommand = Iterm = rcCommandRaw = 0;
+    }
+
+
+    /**
+      Main PID loop logic
+    */
+    function pidLoop() {
+        //var rc = navigator.getGamepads()[1].axes[2];
+        if(paused) return;
+
+        var gyroAngularVelocity = gyroDelayer.get();
+
+        var rc = rcFilter.get(rcCommandRaw);
+        var throttle = thrFilter.get(rcThrottle);
+        var rcCommand = rcCurve.apply(rc);
+
+        var error = rcCommand - gyroAngularVelocity;
+
+
+
+        // P
+        var Pterm = P*error;
+
+
+
+        // F
+        var dRc = (rcCommand - prevRcCommand)/STEP; // derivative of setpoint
+        dRc = spFilter.get(dRc); // apply derivative filter
+        var fWeight = 0;
+
+        if(Math.abs(rc) >= ffTransition)
+            fWeight = 1;
+        else
+            fWeight = Math.abs(rc)/ffTransition;
+
+        var Fterm = fWeight*F*dRc;
+
+
+
+
+        // iterm relax
+        var iRelax = 1;
+        if(iTermRelaxEnabled) {
+          var rcHpf = rcCommand - dRcFilter.get(rcCommand);
+          iRelax = 1 - Math.abs(rcHpf) / 30.0 /*ITERM_RELAX_SETPOINT_THRESHOLD*/; // bf based
+          iRelax = Math.max(0, iRelax);
+        }
+
+        // antigravity
+        var antiGravity = 1;
+        if(withThrottle) {
+          var thrHpf = throttle - dThrFilter.get( throttle );
+          antiGravity = antiGravityGain==0 ? 1 :
+              (1 + Math.abs(thrHpf) * 10 * (antiGravityGain - 1)); // bf based
+        }
+        
+        // I
+        if(I == 0)
+            Iterm = 0;
+        else
+            Iterm += antiGravity*iRelax*I*error*STEP;
+
+        
+        // D
+        var Dterm = -D*(gyroAngularVelocity - prevGyroAngularVelocity)/STEP;
+        Dterm = dFilter.get(Dterm);
+
+
+
+        prevGyroAngularVelocity = gyroAngularVelocity;
+        prevRcCommand = rcCommand;
+
+        //var noise = noiseFilter.get((Math.random()-0.5)/0.5);
+
+        var PID_SUM = 0
+            + Pterm
+            + Iterm
+            + Dterm
+            + Fterm
+            ;
+
+        if(Math.abs(PID_SUM) > MAX_PID)
+            PID_SUM = Math.sign(PID_SUM)*MAX_PID; // cap PID_SUM
+
+
+
+        // motor mixer
+        if(!withThrottle)
+            rcThrottle = 0.5;
+        var m1cmd = rcThrottle+(PID_SUM/MAX_PID/2);
+        var m2cmd = rcThrottle-(PID_SUM/MAX_PID/2);
+
+        // simple air mode. |m1cmd-m2cmd| is never > 1
+        // simply shift both motors up or down
+        var mCmdDiff;
+        if((mCmdDiff = Math.max(m1cmd, m2cmd) - 1) > 0 // above max motor
+          || (mCmdDiff = Math.min(m1cmd, m2cmd)) < 0) { // below min motor
+            m1cmd -= mCmdDiff;
+            m2cmd -= mCmdDiff;
+        }
+
+        balancer.update(m1cmd, m2cmd);
+
+        gyroDelayer.put(balancer.angularVelocity);
+
+
+        if(!iteration) {
+          var f;
+          if($('#EXP').is(':checked'))
+            f = function(x) { return Math.sign(x)*Math.pow(Math.abs(x), 1/1.5); }
+          else
+            f = function(x) { return x; }
+
+          var t = new Date().getTime();
+
+          if($('#G_SP').is(':checked'))
+              sRc.append(t, f(rcCommand/rcCurve.maxAnuglarVelocity()));
+          if($('#G_P').is(':checked'))
+              sP.append(t, f(Pterm/MAX_PID));
+          if($('#G_I').is(':checked'))
+              sI.append(t, f(Iterm/MAX_PID));
+          if($('#G_D').is(':checked'))
+              sD.append(t, f(Dterm/MAX_PID));
+          if($('#G_F').is(':checked'))
+              sF.append(t, f(Fterm/MAX_PID));
+          if($('#G_RPM').is(':checked'))
+              sVel.append(t, f(gyroAngularVelocity/rcCurve.maxAnuglarVelocity()));
+          if($('#G_SUM').is(':checked'))
+              sSum.append(t, f(PID_SUM/MAX_PID*1));
+          if(withThrottle)
+              sThr.append(t, f(throttle*2-1));
+
+        }
+
+        iteration = ++iteration%UPDATE_GRAPH_INTERVAL;
+
+        if(drawRequestId === null)
+          drawRequestId = requestAnimationFrame(function(){
+            balancerPanel.draw(rc, withThrottle ? rcThrottle : null);
+            drawRequestId = null;
+          });
+
+
+      } // end pidLoop()
+
+
+
+      function createTimeline() {
+        tracesChart = new SmoothieChart({millisPerPixel:STEP*1000,
+            interpolation:'linear',
+            maxValue:1.1,
+            minValue:-1.1,
+            grid:{fillStyle:'#ffffff',millisPerLine :0},
+            nonRealtimeData:true});
+        tracesChart.addTimeSeries(sThr, { fillStyle: 'rgba(0, 255, 0, .1)'});
+        tracesChart.addTimeSeries(sRc, { strokeStyle: 'rgba(255, 0, 0, 1)', lineWidth: 1 });
+        tracesChart.addTimeSeries(sP, { strokeStyle: 'brown', lineWidth: 1 });
+        tracesChart.addTimeSeries(sI, { strokeStyle: 'rgba(0, 255, 0, 1)', lineWidth: 1 });
+        tracesChart.addTimeSeries(sD, { strokeStyle: 'rgba(0, 255, 255, 1)', lineWidth: 1 });
+        tracesChart.addTimeSeries(sF, { strokeStyle: 'rgba(255, 127, 0, 1)', lineWidth: 1 });
+        tracesChart.addTimeSeries(sVel, { strokeStyle: 'rgba(0, 0, 255, 1)', lineWidth: 1 });
+        tracesChart.addTimeSeries(sSum, { strokeStyle: 'rgba(255, 0, 255, 1)', lineWidth: 1 });
+        tracesChart.streamTo(document.getElementById("tracesChart"), 0);
+      }
+
+
+      function constrain(val, min, max) {
+        return Math.min(max, Math.max(min, val));
+      }
+
+
+      /**
+          Simple model of a DC motor based on the standard Torque/RPM rlationship:
+
+           Torque
+            ^
+            |\
+            |  \
+            |    \
+            |      \
+            |------------> AngularVelocity
+
+            T = V*Kv - w*Kw
+
+            T - torque
+            V - voltage
+            w - angular velocity
+            Kv, Kw - constants
+
+            https://www.precisionmicrodrives.com/content/dc-motor-speed-voltage-and-torque-relationships/
+            https://www.motioncontroltips.com/torque-equation/
+
+
+          For simplicity we assume that the maximum angular velocity of the motor is 1 (zero Torque)
+      */
+      function Motor() {
+        this.angularVelocity = 0;
+        this.angle = 0;
+        this.maxAngularVelocity = 1;
+
+        // We precalculate Kv such that when angularVelocity==1 and command==1 the net torque is zero
+        // Thus we make the maxAngularVelocity == 1
+        var Kv = this.maxAngularVelocity + this.maxAngularVelocity*this.maxAngularVelocity*MOTOR_DRAG;
+        //var Kw = 1;
+
+
+        this.update = function(command) {
+          // command is 0 to 1. It emulates the PWM signal or the voltage supplied to the motor.
+
+
+          // T = V*Kv - w*Kw
+          var motorTorque = command*Kv - this.angularVelocity /* *Kw */;
+          var propellerTorque = this.angularVelocity*this.angularVelocity*MOTOR_DRAG; // load torque from quadratic air resistence
+
+          this.angularVelocity += (motorTorque - propellerTorque)/MOTOR_MOMENT_OF_INERTIA
+                                    *STEP; // integrate acceleration to get velocity
+
+          // constrain the ang.vel just in case of overflow
+          this.angularVelocity = constrain(this.angularVelocity, 0, this.maxAngularVelocity);
+
+          this.angle += this.angularVelocity*STEP;
+          this.angle %= 360;
+        }
+
+        this.getThrust = function() {
+          // thrust, being an aerodymanic force, follows closely a quadratic law of the airspeed
+          return this.angularVelocity*this.angularVelocity;
+        }
+
+        this.reset = function() {
+          this.angle = 0;
+          this.angularVelocity = 0;
+        }
+      }
+
+
+
+
+
+
+      /**
+        Rod with two motors
+      */
+      function Balancer() {
+        this.motors = [ new Motor(), new Motor() ];
+        this.angularVelocity = 0;
+        this.angle = 0;
+        this.cg = .5;
+        this.momentOfInertia = BALANCER_MOMENT_OF_INERTIA;
+
+        this.update = function(m1cmd, m2cmd) {
+          this.motors[0].update(m1cmd);
+          this.motors[1].update(m2cmd);
+
+          var cg = this.cg/100;
+          var torque1 = cg*this.motors[0].getThrust();
+          var torque2 = -(1-cg)*this.motors[1].getThrust();
+
+          this.angularVelocity +=
+            (torque1
+              + torque2
+              - Math.sign(this.angularVelocity)*this.angularVelocity*this.angularVelocity*BALANCER_DRAG
+            )/this.momentOfInertia*STEP;
+
+          this.angle += this.angularVelocity*STEP;
+          this.angle %=360;
+        }
+
+        this.reset = function() {
+          this.angle = 0;
+          this.angularVelocity = 0;
+          this.motors[0].reset();
+          this.motors[1].reset();
+        }
+      }
+
+
+
+      /**
+        PT1 Filter. Based on betaflight code
+      */
+      function Pt1Filter(cutoff) {
+        this.setCutoff = function(cutoff) {
+          var RC = 1 / ( 2*Math.PI * cutoff);
+          this.k = STEP / (RC + STEP);
+        }
+
+        this.get = function(val) {
+          this.state = this.state + this.k * (val - this.state);
+          return this.state;
+        }
+
+        this.reset = function() {
+          this.state = 0;
+        }
+
+        this.reset();
+        this.setCutoff(cutoff);
+      }
+
+
+
+      /**
+        Basic LFP filter
+      */
+      function MovingAverage(size, decimate) {
+        this.vals = [];
+        this.vals.length = size;
+        this.size = size;
+
+        this.get = function(val) {
+            if(!(this.index%decimate))
+                this.savedVal = val;
+            else
+                val = this.savedVal;
+            this.sum -= this.vals[this.index];
+            this.vals[this.index] = val;
+            this.sum += val;
+            if(++this.index >= this.size)
+                this.index = 0;
+            return this.sum/this.size;
+        }
+
+        this.reset = function() {
+          this.vals.fill(0);
+          this.index = 0;
+          this.sum = 0;
+          this.savedVal = 0;
+        }
+
+        this.reset();
+      }
+
+
+
+      /**
+        Simulate delay by keeping buffer
+      */
+      function Delayer(amount) {
+        this.buf = [];
+        this.buf.length = amount;
+        this.buf.fill(0);
+        this.index = 0;
+
+        this.get = function() {
+            if(++this.index >= this.buf.length)
+                this.index = 0;
+            return this.buf[this.index];
+        }
+
+        this.put = function(val) {
+            this.buf[this.index] = val;
+        }
+
+        this.reset = function() {
+          this.buf.fill(0);
+        }
+      }
+
+
+
+
+
+      /**
+        Implements betaflight like curve with rate and super
+      */
+      function RcCurve() {
+        this.rate = 1;
+        this.super = .7;
+        this.deadzone = .2;
+
+        this.apply = function(raw) {
+          var dz = this.deadzone/100;
+          var araw = Math.abs(raw);
+
+         if(dz) {
+            if(araw < dz)
+              raw = 0;
+            else
+              raw = Math.sign(raw)*(araw - dz)/(1-dz);
+          }
+
+          // normal rate
+          var angularVelocity = 200 * this.rate * raw;
+
+          // super rate
+          if(this.super) {
+            var superFactor = 1.0 / constrain(1.0 - araw*this.super, 0.01, 1);
+            angularVelocity *= superFactor;
+          }
+
+          return angularVelocity;
+        }
+
+        this.maxAnuglarVelocity = function() {
+          return this.apply(1);
+        }
+      }
+
+
+
+
+
+
+      /**
+        Implements the canvas drawing logic of the balancer
+      */
+      function BalancerPanel(canvas, rcCurve) {
+        this.rcCurveBackground = null;
+        var ctx = canvas.getContext("2d");
+
+        this.clearRcCurveBackground = function() {
+          this.rcCurveBackground = null;
+        };
+        
+        /**
+            The background with the rc curve changes only when the rates change.
+            Thus we pre-render it into a buffer, to avoid drawing the curves on every frame.
+        */
+        this.updateRcCurveBackground = function() {
+          ctx.setTransform(1, 0, 0, 1, 0, 0); // identity matrix
+
+          // clear and draw border
+          ctx.strokeStyle="lightblue";
+          ctx.lineWidth = 1;
+          ctx.clearRect(0, 0, canvas.width, canvas.height);
+          ctx.strokeRect(0, 0, canvas.width, canvas.height);
+
+          // set coordinate system x[-1;1] y[-1;1]
+          ctx.translate(canvas.width/2, canvas.height/2);
+          ctx.scale(canvas.width/2, -canvas.height/2);
+
+          // scale line width
+          ctx.lineWidth = 1.0/canvas.width*2;
+
+          // draw the curves by connecting lines at DRAW_STEP distance
+          var maxAngularVelocity = rcCurve.maxAnuglarVelocity();
+          ctx.beginPath();
+          ctx.moveTo(-1,-1);
+          var DRAW_STEP = 0.1;
+          var x = -1 + DRAW_STEP;
+          while(x <= 1) {
+            ctx.lineTo(x, rcCurve.apply(x)/maxAngularVelocity);
+            x += DRAW_STEP;
+          }
+          ctx.stroke();
+
+
+          // draw vertical lines for the deadzone if needed
+          var dz = rcCurve.deadzone/100;
+          if(dz > 0) {
+            ctx.strokeStyle="#e0e0ff";
+            ctx.beginPath();
+            ctx.moveTo(-dz,-1);
+            ctx.lineTo(-dz,1);
+            ctx.stroke();
+            ctx.moveTo(dz,-1);
+            ctx.lineTo(dz,1);
+            ctx.stroke();
+          }
+
+          // save the buffer
+          this.rcCurveBackground = ctx.getImageData(0,0,canvas.width,canvas.height);
+
+        }
+
+        // main draw function
+        this.draw = function(rc, throttle) {
+          if(!this.rcCurveBackground)
+            this.updateRcCurveBackground();
+
+          // blit the prerendered rc curve
+          ctx.putImageData(this.rcCurveBackground,0,0);
+
+          ctx.setTransform(1, 0, 0, 1, 0, 0); // identity matrix
+
+          ctx.translate(canvas.width/2, canvas.height/2);
+          ctx.scale(canvas.width/2, canvas.height/2);
+
+          // throttle colored area
+          if(throttle) {
+              throttle = 1 - 2*throttle;
+              ctx.fillStyle='rgb(0,255,0,0.05)';
+              ctx.fillRect(-1, throttle, 2, 2-2*throttle);
+          }
+
+          // draw setpoint line
+          ctx.beginPath();
+          ctx.moveTo(rc, -1);
+          ctx.lineTo(rc, 1);
+          ctx.strokeStyle = 'lightcoral';
+          ctx.stroke();
+
+
+          // rotate the balancer by using coordinate transform
+          ctx.rotate(balancer.angle*Math.PI/180);
+
+          ctx.save();
+          ctx.translate(.5-balancer.cg/100, 0);
+          // draw arm
+          ctx.fillStyle='darkgrey';
+          ctx.beginPath();
+          ctx.fillRect(-.5,-.025,1,.05);
+
+          //draw motors
+          function drawMotor(motor, x) {
+            var mWidth = 1/3;
+            var mVel = motor.angularVelocity / motor.maxAngularVelocity;
+            // map motor rpm to hue blue (lowest), through green to red (highest)
+            ctx.fillStyle='hsl('+240*(1-mVel)+', 100%, 50%)';
+
+            ctx.fillRect(x-mWidth/2,-.075,mWidth,.05);
+          }
+          drawMotor(balancer.motors[0], -0.5);
+          drawMotor(balancer.motors[1], 0.5);
+
+          // draw CG symbol
+          ctx.restore();
+
+          ctx.fillStyle='black';
+          ctx.arc(0, 0, .05, 0, 2*Math.PI);
+          ctx.fill();
+          ctx.beginPath();
+          ctx.moveTo(0,0);
+          ctx.arc(0, 0, .05, 0, Math.PI/2);
+          ctx.moveTo(0,0);
+          ctx.arc(0, 0, .05, Math.PI, Math.PI*3/2);
+          ctx.closePath();
+          ctx.fillStyle='yellow';
+          ctx.fill();
+
+          if(window.debug) {
+            ctx.setTransform(1, 0, 0, 1, 0, 0);
+            ctx.fillStyle='blue';
+            ctx.fillText(window.debug,100,100);
+          }
+        }
+      }
+
+
+
+      // main initialization on page load
+      $(function() {
+        balancerPanel = new BalancerPanel($('#balancer')[0], rcCurve);
+
+        $('#tracesChart').attr('width', ($('body').width()))
+            .attr('height', ($(window).height()*0.5));
+
+        $('#balancer').attr('width', $(window).height()*.4)
+                      .attr('height', $(window).height()*.4);
+
+        createTimeline();
+
+        // mouse move handler
+        $('#balancer').on('mousemove', function(e) {
+            var pOffset = $(this).offset();
+            var px = event.pageX - pOffset.left;
+            var py = event.pageY - pOffset.top;
+            var w = $(this).width()/2;
+            var h = $(this).height();
+
+            rcCommandRaw = (px - w)/w;
+            rcThrottle = 1 - py/h;
+        })
+
+
+        // load persistent config
+        if(localStorage['pidsim']) {
+            try {
+                config = JSON.parse(localStorage['pidsim']);
+            }
+            catch(e) {
+                config = {};
+            }
+            for(var k in config) {
+                var val = config[k];
+                if(typeof val == 'boolean')
+                    $('#'+k).prop('checked', val);
+                else
+                    $('#'+k).val(val);
+            }
+        }
+
+
+        // input change handling
+        $(':input').on('change click keyup input paste', function(e) {
+            var v;
+            if($(this).is(':checkbox'))
+                v = $(this).is(':checked');
+            else {
+                v = parseFloat(this.value);
+                if(isNaN(v))
+                    return;
+            }
+
+            switch(this.id) {
+                case 'P':
+                    P = v*PTERM_SCALE;
+                    break;
+                case 'I':
+                    I = v*ITERM_SCALE;
+                    break;
+                case 'D':
+                    D = v*DTERM_SCALE;
+                    break;
+                case 'F':
+                    F = v*FEEDFORWARD_SCALE;
+                    break;
+                case 'FT':
+                    ffTransition = v;
+                    break;
+                case 'IR':
+                    iTermRelaxEnabled = v > 0;
+                    dRcFilter.setCutoff(v);
+                    break;
+                case 'DZ':
+                    rcCurve.deadzone = constrain(v, 0, 100);
+                    break;
+                case 'CG':
+                    balancer.cg = constrain(v, 1, 99);
+                    break;
+                case 'RT':
+                    rcCurve.rate = v;
+                    balancerPanel.clearRcCurveBackground();
+                    break;
+                case 'SRT':
+                    rcCurve.super = v;
+                    balancerPanel.clearRcCurveBackground();
+                    break;
+                case 'GD':
+                    v = Math.round(v);
+                    if(v >= 0)
+                      gyroDelayer = new Delayer(v);
+                    break;
+                case 'MS':
+                    tracesChart.options.millisPerPixel = v;
+                    break;
+                case 'MI':
+                    balancer.momentOfInertia = BALANCER_MOMENT_OF_INERTIA*v;
+                    break;
+                case 'THR':
+                    withThrottle = v;
+                    break;
+                case 'AG':
+                    antiGravityGain = v;
+                    break;
+            }
+
+
+            config[this.id] = v;
+
+            localStorage['pidsim'] = JSON.stringify(config);
+        }).change();
+
+
+        function pause() {
+          paused = !paused;
+          if(paused)
+              tracesChart.stop();
+          else
+              tracesChart.start();
+        }
+
+        $('#defaults').on('click', function() {
+          delete localStorage['pidsim'];
+          document.location.reload();
+        });
+
+        $('#reset').on('click', reset);
+
+
+        $('#pause').on('click', pause);
+        
+        // shortcut keys
+        $(window).on('keypress', function(e) {
+          switch(e.key.toLowerCase()) {
+            case 'p':
+              pause();
+              break;
+            case 'r':
+              reset();
+              break;
+          }
+        });
+
+        $('#balancer').on('mouseover', function() {
+          // remove focus from any input, so that the shortcut keys won't result
+          // into typing
+          $(':focus').blur();
+        });
+
+        // and the waaay we gooo!
+        setInterval(pidLoop, STEP*1000);
+      })
+
+
+    </script>
+  </head>
+    <canvas id="tracesChart"></canvas>
+
+
+    <button id="reset">[R]eset</button>
+    <button id="pause">[P]ause</button>
+    <button id="defaults">Default Settings</button>
+    <div>
+      <div style="display:inline-block;vertical-align:top">
+
+        <table>
+        <tr>
+            <td><input type="checkbox" id="EXP"></td>
+            <td>Expo traces</td>
+            <td></td>
+        </tr>
+        <tr>
+            <td><input type="checkbox" id="G_SP" checked></td>
+            <td style="color:red">Setpoint</td>
+            <td></td>
+        </tr>
+        <tr>
+            <td><input type="checkbox" id="G_RPM" checked></td>
+            <td style="color:blue">Gyro</td>
+            <td></td>
+        </tr>
+        <tr>
+            <td><input type="checkbox" id="G_P" checked></td>
+            <td>P</td>
+            <td><input id="P" size="2" value="10" style="background:brown;color:white"></td>
+        </tr>
+        <tr>
+            <td><input type="checkbox" id="G_I" checked></td>
+            <td style="color:#00ff00">I</td>
+            <td><input id="I" size="2" value="0" style="background:#00ff00"></td>
+        </tr>
+        <tr>
+            <td><input type="checkbox" id="G_D" checked></td>
+            <td style="color:cyan">D</td>
+            <td><input id="D" size="2" value="0" style="background:cyan"></td>
+        </tr>
+        <tr>
+            <td><input type="checkbox" id="G_F" checked></td>
+            <td style="color:orange">F</td>
+            <td><input id="F" size="2" value="0" style="background:orange"></td>
+        </tr>
+        <tr>
+            <td><input type="checkbox" id="G_SUM"></td>
+            <td style="color:magenta">PID Sum</td>
+            <td></td>
+        </tr>
+      </table>
+    </div>
+
+
+
+    <div style="display:inline-block;vertical-align:top;margin-left:50px;">
+      <table>
+        <tr>
+            <td></td>
+            <td>Gyro Delay</td>
+            <td><input id="GD" size="2" value="3">samples</td>
+        </tr>
+        <tr>
+            <td></td>
+            <td>Moment of Intertia</td>
+            <td><input id="MI" size="2" value="100"></td>
+        </tr>
+        <tr>
+            <td></td>
+            <td>Feedforward Transition</td>
+            <td><input id="FT" size="2" value="0"></td>
+        </tr>
+        <tr>
+            <td></td>
+            <td>Iterm Relax Cutoff</td>
+            <td><input id="IR" size="2" value="11">Hz</td>
+        </tr>
+        <tr>
+            <td></td>
+            <td>AntiGravity Gain</td>
+            <td><input id="AG" size="2" value="5"></td>
+        </tr>
+        <tr>
+            <td></td>
+            <td>CG</td>
+            <td><input id="CG" size="2" value="50">%</td>
+        </tr>
+        <tr>
+            <td></td>
+            <td>Deadzone</td>
+            <td><input id="DZ" size="2" value="20">%</td>
+        </tr>
+        <tr>
+            <td></td>
+            <td>Rate</td>
+            <td><input id="RT" size="2" value="1"></td>
+        </tr>
+        <tr>
+            <td></td>
+            <td>SuperRate</td>
+            <td><input id="SRT" size="2" value="0.7"></td>
+        </tr>
+        <tr>
+            <td></td>
+            <td>Graph scale</td>
+            <td><input id="MS" size="2" value="4">ms/pixel</td>
+        </tr>
+        <tr>
+            <td></td>
+            <td>With Throttle</td>
+            <td><input type="checkbox" id="THR"></td>
+        </tr>
+        </table>
+
+      </div>
+
+      <canvas id="balancer" width="400" height="400" style="display:inline-block;vertical-align:top;float:right;margin-right:100px;"></canvas>
+    <div>
+  </body>
+</html>
