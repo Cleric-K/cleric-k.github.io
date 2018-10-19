@@ -195,12 +195,15 @@
         gyroDelayer.put(balancer.angularVelocity);
 
 
-        if(!iteration) {
-          var f;
-          if(config.EXP)
-            f = function(x) { return Math.sign(x)*Math.pow(Math.abs(x), 1/1.5); }
-          else
-            f = function(x) { return x; }
+        if(iteration == 0) {
+          function f(x) {
+            if(config.EXP)
+              x = Math.sign(x)*Math.pow(Math.abs(x), config.EXPV/100);
+            if(config.ZOOM)
+              x *= config.ZOOMV;
+
+            return x;
+          };
 
           var t = new Date().getTime();
 
@@ -806,8 +809,13 @@
         <table>
         <tr>
             <td><input type="checkbox" id="EXP"></td>
-            <td>Expo traces</td>
-            <td></td>
+            <td>Expo</td>
+            <td><input id="EXPV" size="2" value="30">%</td>
+        </tr>
+        <tr>
+            <td><input type="checkbox" id="ZOOM"></td>
+            <td>Zoom</td>
+            <td><input id="ZOOMV" size="2" value="2">x</td>
         </tr>
         <tr>
             <td><input type="checkbox" id="G_SP" checked></td>
