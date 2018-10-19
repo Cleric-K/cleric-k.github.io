@@ -39,7 +39,7 @@
 
     var prevGyroAngularVelocity=0;
     var gyroDelayer = new Delayer(5);
-    var noiseFilter = new MovingAverage(100, 30);
+    var turbFilter = new Pt1Filter(5);
     var rcFilter = new MovingAverage(10, 1);
     var spFilter = new MovingAverage(2, 1);
     var dRcFilter = new Pt1Filter(11); // betaflight default
@@ -47,13 +47,13 @@
     var thrFilter = new MovingAverage(10, 1);
     var dThrFilter = new Pt1Filter(15); // ANTI_GRAVITY_THROTTLE_FILTER_CUTOFF, betaflight default
     var rcCurve = new RcCurve();
-    
+
     var iteration = 0;
-    
+
     var balancer = new Balancer();
     var balancerPanel;
     var tracesChart;
-    
+
     var drawRequestId = null;
     var withThrottle = false;
     var paused = false;
@@ -67,13 +67,14 @@
         ffTransition = 0,
         prevRcCommand = 0,
         iTermRelaxEnabled = true;
-        antiGravityGain = 2000;
+        antiGravityGain = 2000,
+        turbulenceStrength = 0;
 
 
     function reset() {
       balancer.reset();
       gyroDelayer.reset();
-      noiseFilter.reset();
+      turbFilter.reset();
       rcFilter.reset();
       spFilter.reset();
       dRcFilter.reset();
@@ -94,10 +95,14 @@
         var gyroAngularVelocity = gyroDelayer.get();
 
         var rc = rcFilter.get(rcCommandRaw);
-        var throttle = thrFilter.get(rcThrottle);
+        var throttle;
         var rcCommand = rcCurve.apply(rc);
-
         var error = rcCommand - gyroAngularVelocity;
+
+        if(withThrottle)
+          throttle = thrFilter.get(rcThrottle);
+        else
+          throttle = 0.5;
 
 
 
@@ -136,14 +141,14 @@
           antiGravity = antiGravityGain==0 ? 1 :
               (1 + Math.abs(thrHpf) * 10 * (antiGravityGain - 1)); // bf based
         }
-        
+
         // I
         if(I == 0)
             Iterm = 0;
         else
             Iterm += antiGravity*iRelax*I*error*STEP;
 
-        
+
         // D
         var Dterm = -D*(gyroAngularVelocity - prevGyroAngularVelocity)/STEP;
         Dterm = dFilter.get(Dterm);
@@ -153,7 +158,6 @@
         prevGyroAngularVelocity = gyroAngularVelocity;
         prevRcCommand = rcCommand;
 
-        //var noise = noiseFilter.get((Math.random()-0.5)/0.5);
 
         var PID_SUM = 0
             + Pterm
@@ -168,10 +172,8 @@
 
 
         // motor mixer
-        if(!withThrottle)
-            rcThrottle = 0.5;
-        var m1cmd = rcThrottle+(PID_SUM/MAX_PID/2);
-        var m2cmd = rcThrottle-(PID_SUM/MAX_PID/2);
+        var m1cmd = throttle+(PID_SUM/MAX_PID/2);
+        var m2cmd = throttle-(PID_SUM/MAX_PID/2);
 
         // simple air mode. |m1cmd-m2cmd| is never > 1
         // simply shift both motors up or down
@@ -182,33 +184,39 @@
             m2cmd -= mCmdDiff;
         }
 
-        balancer.update(m1cmd, m2cmd);
+        // add noise if needed
+        var turbulence = 0;
+        if(turbulenceStrength) {
+          turbulence = turbulenceStrength * 0.1 * turbFilter.get(Math.random() - .5);
+        }
+
+        balancer.update(m1cmd, m2cmd, turbulence);
 
         gyroDelayer.put(balancer.angularVelocity);
 
 
         if(!iteration) {
           var f;
-          if($('#EXP').is(':checked'))
+          if(config.EXP)
             f = function(x) { return Math.sign(x)*Math.pow(Math.abs(x), 1/1.5); }
           else
             f = function(x) { return x; }
 
           var t = new Date().getTime();
 
-          if($('#G_SP').is(':checked'))
+          if(config.G_SP)
               sRc.append(t, f(rcCommand/rcCurve.maxAnuglarVelocity()));
-          if($('#G_P').is(':checked'))
+          if(config.G_P)
               sP.append(t, f(Pterm/MAX_PID));
-          if($('#G_I').is(':checked'))
+          if(config.G_I)
               sI.append(t, f(Iterm/MAX_PID));
-          if($('#G_D').is(':checked'))
+          if(config.G_D)
               sD.append(t, f(Dterm/MAX_PID));
-          if($('#G_F').is(':checked'))
+          if(config.G_F)
               sF.append(t, f(Fterm/MAX_PID));
-          if($('#G_RPM').is(':checked'))
+          if(config.G_RPM)
               sVel.append(t, f(gyroAngularVelocity/rcCurve.maxAnuglarVelocity()));
-          if($('#G_SUM').is(':checked'))
+          if(config.G_SUM)
               sSum.append(t, f(PID_SUM/MAX_PID*1));
           if(withThrottle)
               sThr.append(t, f(throttle*2-1));
@@ -219,7 +227,7 @@
 
         if(drawRequestId === null)
           drawRequestId = requestAnimationFrame(function(){
-            balancerPanel.draw(rc, withThrottle ? rcThrottle : null);
+            balancerPanel.draw(rc, withThrottle ? throttle : null);
             drawRequestId = null;
           });
 
@@ -331,7 +339,7 @@
         this.cg = .5;
         this.momentOfInertia = BALANCER_MOMENT_OF_INERTIA;
 
-        this.update = function(m1cmd, m2cmd) {
+        this.update = function(m1cmd, m2cmd, externalTorque) {
           this.motors[0].update(m1cmd);
           this.motors[1].update(m2cmd);
 
@@ -343,6 +351,7 @@
             (torque1
               + torque2
               - Math.sign(this.angularVelocity)*this.angularVelocity*this.angularVelocity*BALANCER_DRAG
+              + externalTorque
             )/this.momentOfInertia*STEP;
 
           this.angle += this.angularVelocity*STEP;
@@ -495,7 +504,7 @@
         this.clearRcCurveBackground = function() {
           this.rcCurveBackground = null;
         };
-        
+
         /**
             The background with the rc curve changes only when the rates change.
             Thus we pre-render it into a buffer, to avoid drawing the curves on every frame.
@@ -727,6 +736,12 @@
                 case 'AG':
                     antiGravityGain = v;
                     break;
+                case 'TS':
+                    turbulenceStrength = v;
+                    break;
+                case 'TF':
+                    turbFilter.setCutoff(v);
+                    break;
             }
 
 
@@ -753,7 +768,7 @@
 
 
         $('#pause').on('click', pause);
-        
+
         // shortcut keys
         $(window).on('keypress', function(e) {
           switch(e.key.toLowerCase()) {
@@ -836,16 +851,7 @@
 
     <div style="display:inline-block;vertical-align:top;margin-left:50px;">
       <table>
-        <tr>
-            <td></td>
-            <td>Gyro Delay</td>
-            <td><input id="GD" size="2" value="3">samples</td>
-        </tr>
-        <tr>
-            <td></td>
-            <td>Moment of Intertia</td>
-            <td><input id="MI" size="2" value="100"></td>
-        </tr>
+
         <tr>
             <td></td>
             <td>Feedforward Transition</td>
@@ -881,6 +887,32 @@
             <td>SuperRate</td>
             <td><input id="SRT" size="2" value="0.7"></td>
         </tr>
+        </table>
+      </div>
+
+
+      <div style="display:inline-block;vertical-align:top;margin-left:50px;">
+      <table>
+        <tr>
+            <td></td>
+            <td>Gyro Delay</td>
+            <td><input id="GD" size="2" value="3">samples</td>
+        </tr>
+        <tr>
+            <td></td>
+            <td>Moment of Intertia</td>
+            <td><input id="MI" size="2" value="100"></td>
+        </tr>
+        <tr>
+            <td></td>
+            <td>Turbulence Strength</td>
+            <td><input id="TS" size="2" value="0"></td>
+        </tr>
+        <tr>
+            <td></td>
+            <td>Turbulence Frequency</td>
+            <td><input id="TF" size="2" value="0.1">Hz</td>
+        </tr>
         <tr>
             <td></td>
             <td>Graph scale</td>
@@ -891,7 +923,7 @@
             <td>With Throttle</td>
             <td><input type="checkbox" id="THR"></td>
         </tr>
-        </table>
+      </table>
 
       </div>
 
