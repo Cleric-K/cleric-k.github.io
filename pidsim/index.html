@@ -638,19 +638,35 @@
       $(function() {
         balancerPanel = new BalancerPanel($('#balancer')[0], rcCurve);
 
-        $('#tracesChart').attr('width', ($('body').width()))
-            .attr('height', ($(window).height()*0.5));
+        function resize() {
+          $('#tracesChart').attr('width', ($('body').width()))
+              .attr('height', ($(window).height()*0.5));
 
-        $('#balancer').attr('width', $(window).height()*.4)
-                      .attr('height', $(window).height()*.4);
+          var bsz = Math.min($('body').width(), $(window).height()*.4);
+          $('#balancer').attr('width', bsz)
+                        .attr('height', bsz);
+
+          balancerPanel.clearRcCurveBackground();
+        }
+        $(window).resize(resize);
+        resize();
 
         createTimeline();
 
         // mouse move handler
-        $('#balancer').on('mousemove', function(e) {
+        $('#balancer').on('mousemove touchmove', function(e) {
+            var x, y;
+            if(e.touches) {
+              x = e.touches[0].pageX;
+              y = e.touches[0].pageY;
+            }
+            else {
+              x = event.pageX;
+              y = event.pageY;
+            }
             var pOffset = $(this).offset();
-            var px = event.pageX - pOffset.left;
-            var py = event.pageY - pOffset.top;
+            var px = x - pOffset.left;
+            var py = y - pOffset.top;
             var w = $(this).width()/2;
             var h = $(this).height();
 
@@ -804,6 +820,9 @@
     <button id="pause">[P]ause</button>
     <button id="defaults">Default Settings</button>
     <div>
+
+      <canvas id="balancer" width="400" height="400" style="display:inline-block;vertical-align:top;margin-right:100px;float:right"></canvas>
+
       <div style="display:inline-block;vertical-align:top">
 
         <table>
@@ -935,7 +954,7 @@
 
       </div>
 
-      <canvas id="balancer" width="400" height="400" style="display:inline-block;vertical-align:top;float:right;margin-right:100px;"></canvas>
+
     <div>
   </body>
 </html>
